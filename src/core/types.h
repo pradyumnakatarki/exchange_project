@@ -44,18 +44,18 @@ namespace exchange::core {
 
     using Symbol = std::array<char, 16>;
 
-    constexpr Symbol make_symbol(std::string_view str) {
+    constexpr Symbol make_symbol(std::string_view str) noexcept {
         Symbol symbol{};
         std::copy_n(str.data(), std::min(str.size(), symbol.size()), symbol.data());
         return symbol;
     }
 
-    constexpr std::string_view symbol_view(const Symbol& symbol) {
+    constexpr std::string_view symbol_view(const Symbol& symbol) noexcept {
         return std::string_view(symbol.data(), std::find(symbol.begin(), symbol.end(), '\0') - symbol.begin());
     }
 
     struct SymbolLess {
-        bool operator()(const Symbol& lhs, const Symbol& rhs) const {
+        bool operator()(const Symbol& lhs, const Symbol& rhs) const noexcept {
             return std::lexicographical_compare(lhs.begin(), lhs.end(), rhs.begin(), rhs.end());
         }
     };

@@ -17,7 +17,7 @@ namespace exchange::core {
         };
 
     public:
-        bool push(const T &value) {
+        bool push(const T &value) noexcept {
             const std::uint64_t tail = tail_.value.load(std::memory_order_relaxed);
             const std::uint64_t head = head_.value.load(std::memory_order_acquire);
 
@@ -30,7 +30,7 @@ namespace exchange::core {
             return true;
         }
 
-        bool pop(T &value) {
+        bool pop(T &value) noexcept {
             const std::uint64_t head = head_.value.load(std::memory_order_relaxed);
             const std::uint64_t tail = tail_.value.load(std::memory_order_acquire);
 
@@ -43,7 +43,7 @@ namespace exchange::core {
             return true;
         }
 
-        [[nodiscard]] bool empty() const {
+        [[nodiscard]] bool empty() const noexcept {
             return head_.value.load(std::memory_order_acquire) == tail_.value.load(std::memory_order_acquire);
         }
 

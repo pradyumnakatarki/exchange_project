@@ -29,7 +29,7 @@ namespace exchange::core {
         MemoryPool(MemoryPool &&) = delete;
         MemoryPool &operator=(MemoryPool &&) = delete;
 
-        T *allocate() {
+        T *allocate() noexcept {
             if (free_list_head_ == nullptr) [[unlikely]] {
                 return nullptr;
             }
@@ -54,7 +54,7 @@ namespace exchange::core {
 
     private:
     
-        void initialize_free_list() {
+        void initialize_free_list() noexcept {
             free_list_head_ = nullptr;
             for (std::size_t index = 0; index < N; ++index) {
                 auto *node = reinterpret_cast<FreeNode *>(slots_[index].storage.data());

@@ -80,3 +80,32 @@ set_target_properties(
         OUTPUT_NAME "liquidity_bot"
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools"
 )
+
+# ==========================================
+# Google Benchmark Integration
+# ==========================================
+include(FetchContent)
+FetchContent_Declare(
+    benchmark
+    GIT_REPOSITORY https://github.com/google/benchmark.git
+    GIT_TAG v1.8.3
+)
+# Disable benchmark tests to speed up your build
+set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(benchmark)
+
+add_executable(exchange_bench src/benchmark_main.cpp)
+
+target_link_libraries(
+    exchange_bench 
+    PRIVATE 
+        exchange_project 
+        benchmark::benchmark
+)
+
+set_target_properties(
+    exchange_bench
+    PROPERTIES
+        OUTPUT_NAME "exchange_bench"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/src"
+)

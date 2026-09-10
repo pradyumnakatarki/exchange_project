@@ -8,80 +8,65 @@
 #include <limits>
 #include <map>
 #include <memory>
-#include <memory_resource>
 #include <optional>
 #include <span>
 #include <unordered_map>
 
-#include "core/memory_pool.h"
 #include "core/types.h"
 #include "matching/events.h"
 #include "matching/level.h"
+#include "matching/order.h"
 
-namespace exchange::matching {
+namespace exchange::naive {
 
-struct OrderRecord {
-  Order *order{nullptr};
-  core::OrderStatus last_status{core::OrderStatus::NEW};
-};
-
-static_assert(std::is_trivially_copyable_v<OrderRecord>);
-
-struct PriceLevelView {
-  core::Price price{0};
-  core::Quantity qty{0};
-};
-
-static_assert(std::is_trivially_copyable_v<PriceLevelView>);
-
-class OwnedMonotonicBuffer {
-public:
-  explicit OwnedMonotonicBuffer(std::size_t bytes)
-      : storage_(std::make_unique<std::byte[]>(bytes)),
-        resource_(storage_.get(), bytes, std::pmr::null_memory_resource()) {}
-
-  OwnedMonotonicBuffer(const OwnedMonotonicBuffer &) = delete;
-  OwnedMonotonicBuffer &operator=(const OwnedMonotonicBuffer &) = delete;
-  OwnedMonotonicBuffer(OwnedMonotonicBuffer &&) = delete;
-  OwnedMonotonicBuffer &operator=(OwnedMonotonicBuffer &&) = delete;
-
-  [[nodiscard]] std::pmr::memory_resource *resource() noexcept {
-    return &resource_;
-  }
-
-private:
-  std::unique_ptr<std::byte[]> storage_;
-  std::pmr::monotonic_buffer_resource resource_;
-};
+using matching::Event;
+using matching::EventType;
+using matching::Level;
+using matching::Order;
+using matching::OrderAccepted;
+using matching::OrderCanceled;
+using matching::OrderFilled;
+using matching::OrderPartiallyFilled;
+using matching::OrderRecord;
+using matching::OrderReduced;
+using matching::OrderRejected;
+using matching::OrderRested;
+using matching::PriceLevelView;
+using matching::ReasonCode;
+using matching::Trade;
 
 template <
     std::size_t OrderCapacity = 1'000'000, std::size_t LevelCapacity = 10'000,
     std::size_t EventCapacity = 262'144, std::size_t StopCapacity = 65'536>
 class OrderBook {
-  using BidMap = std::pmr::map<core::Price, Level *, std::greater<core::Price>>;
-  using AskMap = std::pmr::map<core::Price, Level *, std::less<core::Price>>;
-  using StopMap = std::pmr::multimap<core::Price, Order *>;
-  using OrderMap = std::pmr::unordered_map<core::OrderId, OrderRecord>;
-
-  static constexpr std::size_t ORDER_INDEX_BYTES =
-      (OrderCapacity * 128U) + (OrderCapacity * 16U);
-  static constexpr std::size_t LEVEL_INDEX_BYTES = LevelCapacity * 128U;
-  static constexpr std::size_t STOP_INDEX_BYTES = StopCapacity * 128U;
+  using BidMap = std::map<core::Price, Level *, std::greater<core::Price>>;
+  using AskMap = std::map<core::Price, Level *, std::less<core::Price>>;
+  using StopMap = std::multimap<core::Price, Order *>;
+  using OrderMap = std::unordered_map<core::OrderId, OrderRecord>;
 
 public:
   explicit OrderBook(core::Symbol symbol)
-      : symbol_(symbol), order_index_buffer_(ORDER_INDEX_BYTES),
-        bid_index_buffer_(LEVEL_INDEX_BYTES),
-        ask_index_buffer_(LEVEL_INDEX_BYTES),
-        stop_buy_index_buffer_(STOP_INDEX_BYTES),
-        stop_sell_index_buffer_(STOP_INDEX_BYTES),
-        bids_(std::greater<core::Price>{}, bid_index_buffer_.resource()),
-        asks_(std::less<core::Price>{}, ask_index_buffer_.resource()),
-        stop_buys_(stop_buy_index_buffer_.resource()),
-        stop_sells_(stop_sell_index_buffer_.resource()),
-        orders_(order_index_buffer_.resource()),
-        event_storage_(std::make_unique<Event[]>(EventCapacity)) {
-    orders_.reserve(OrderCapacity);
+      : symbol_(symbol),
+        bids_(std::greater<core::Price>{}),
+        asks_(std::less<core::Price>{}),
+        stop_buys_(),
+        stop_sells_(),
+        orders_(),
+        event_storage_(std::make_unique<Event[]>(EventCapacity)) {}
+
+  ~OrderBook() {
+    for (auto &[id, record] : orders_) {
+      if (record.order != nullptr) {
+        delete record.order;
+        record.order = nullptr;
+      }
+    }
+    for (auto &[price, level] : bids_) {
+      delete level;
+    }
+    for (auto &[price, level] : asks_) {
+      delete level;
+    }
   }
 
   OrderBook(const OrderBook &) = delete;
@@ -103,29 +88,23 @@ public:
       return events();
     }
 
-    Order *order = order_pool_.allocate();
-    if (order == nullptr) [[unlikely]] {
-      emit_rejected(timestamp, order_id, ReasonCode::ORDER_POOL_EXHAUSTED);
-      return events();
-    }
-
     const core::Quantity peak_qty =
         order_type == core::OrderType::ICEBERG ? display_qty : 0U;
-    order = std::construct_at(order, Order{
-                                         .id = order_id,
-                                         .side = side,
-                                         .price = price,
-                                         .qty = qty,
-                                         .original_qty = qty,
-                                         .display_qty = qty,
-                                         .hidden_qty = 0,
-                                         .timestamp = timestamp,
-                                         .type = order_type,
-                                         .status = core::OrderStatus::NEW,
-                                         .participant_id = participant_id,
-                                         .trigger_price = trigger_price,
-                                         .peak_qty = peak_qty,
-                                     });
+    Order *order = new Order{
+        .id = order_id,
+        .side = side,
+        .price = price,
+        .qty = qty,
+        .original_qty = qty,
+        .display_qty = qty,
+        .hidden_qty = 0,
+        .timestamp = timestamp,
+        .type = order_type,
+        .status = core::OrderStatus::NEW,
+        .participant_id = participant_id,
+        .trigger_price = trigger_price,
+        .peak_qty = peak_qty,
+    };
 
     prepare_visible_slice(*order);
     orders_.insert_or_assign(
@@ -198,28 +177,21 @@ public:
     emit_canceled(timestamp, order_id, order->qty);
     retire_order(*order, core::OrderStatus::CANCELED);
 
-    Order *replacement = order_pool_.allocate();
-    if (replacement == nullptr) [[unlikely]] {
-      emit_rejected(timestamp, order_id, ReasonCode::ORDER_POOL_EXHAUSTED);
-      return events();
-    }
-
-    replacement =
-        std::construct_at(replacement, Order{
-                                           .id = order_id,
-                                           .side = side,
-                                           .price = new_price,
-                                           .qty = new_qty,
-                                           .original_qty = new_qty,
-                                           .display_qty = new_qty,
-                                           .hidden_qty = 0,
-                                           .timestamp = timestamp,
-                                           .type = type,
-                                           .status = core::OrderStatus::NEW,
-                                           .participant_id = participant_id,
-                                           .trigger_price = trigger_price,
-                                           .peak_qty = peak_qty,
-                                       });
+    Order *replacement = new Order{
+        .id = order_id,
+        .side = side,
+        .price = new_price,
+        .qty = new_qty,
+        .original_qty = new_qty,
+        .display_qty = new_qty,
+        .hidden_qty = 0,
+        .timestamp = timestamp,
+        .type = type,
+        .status = core::OrderStatus::NEW,
+        .participant_id = participant_id,
+        .trigger_price = trigger_price,
+        .peak_qty = peak_qty,
+    };
 
     prepare_visible_slice(*replacement);
     orders_[order_id] = OrderRecord{.order = replacement,
@@ -466,32 +438,28 @@ private:
     return level;
   }
 
-  [[nodiscard]] Level *allocate_level(core::Price price) noexcept {
-    Level *level = level_pool_.allocate();
-    if (level == nullptr) {
-      return nullptr;
-    }
-
-    return std::construct_at(level, Level{
-                                        .price = price,
-                                        .total_qty = 0,
-                                        .order_count = 0,
-                                        .head = nullptr,
-                                        .tail = nullptr,
-                                    });
+  [[nodiscard]] Level *allocate_level(core::Price price) {
+    return new Level{
+        .price = price,
+        .total_qty = 0,
+        .order_count = 0,
+        .head = nullptr,
+        .tail = nullptr,
+    };
   }
 
   void retire_order(Order &order, core::OrderStatus terminal_status,
                     bool refresh_best = true) noexcept {
     bool removed_best_level = false;
+    const core::Side side = order.side;
 
     if (order.parent_level != nullptr) {
       Level *level = order.parent_level;
       level->remove_order(&order);
       if (level->is_empty()) {
-        removed_best_level = order.side == core::Side::BUY ? best_bid_ == level
-                                                           : best_ask_ == level;
-        deactivate_level(order.side, level->price, level);
+        removed_best_level = side == core::Side::BUY ? best_bid_ == level
+                                                     : best_ask_ == level;
+        deactivate_level(side, level->price, level);
       }
     } else if (order.is_stop_order()) {
       erase_stop_reference(order);
@@ -500,9 +468,9 @@ private:
     orders_[order.id] =
         OrderRecord{.order = nullptr, .last_status = terminal_status};
 
-    order_pool_.deallocate(&order);
+    delete &order;
     if (refresh_best && removed_best_level) {
-      refresh_best_level(order.side);
+      refresh_best_level(side);
     }
   }
 
@@ -519,7 +487,7 @@ private:
         level_it->second = nullptr;
       }
     }
-    level_pool_.deallocate(level);
+    delete level;
   }
 
   void execute_trade_slice(Order &aggressor, Order &passive,
@@ -892,12 +860,6 @@ private:
 
   core::Symbol symbol_{};
 
-  OwnedMonotonicBuffer order_index_buffer_;
-  OwnedMonotonicBuffer bid_index_buffer_;
-  OwnedMonotonicBuffer ask_index_buffer_;
-  OwnedMonotonicBuffer stop_buy_index_buffer_;
-  OwnedMonotonicBuffer stop_sell_index_buffer_;
-
   BidMap bids_;
   AskMap asks_;
   StopMap stop_buys_;
@@ -907,9 +869,6 @@ private:
   Level *best_bid_{nullptr};
   Level *best_ask_{nullptr};
 
-  core::MemoryPool<Order, OrderCapacity> order_pool_{};
-  core::MemoryPool<Level, LevelCapacity> level_pool_{};
-
   std::unique_ptr<Event[]> event_storage_;
   std::size_t event_count_{0};
 
@@ -918,4 +877,5 @@ private:
   core::Price last_trade_price_{0};
 };
 
-} // namespace exchange::matching
+} // namespace exchange::naive
+
